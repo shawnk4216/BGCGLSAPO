@@ -73,10 +73,8 @@ def token_gradients(model, input_ids, input_slice, target_slice, loss_slice):
     
     loss.backward()
     
-    grad = one_hot.grad.clone()
-    grad = grad / grad.norm(dim=-1, keepdim=True)
-    
-    return grad
+    return one_hot.grad.clone()
+
 
 
 class NpEncoder(json.JSONEncoder):
