@@ -80,7 +80,7 @@ def query_mediator_llm(processor, model, original_prompt, saliency_report, nll_s
         "You will be given the original prompt, its Negative Log-Likelihood (NLL) score, and a list of tokens "
         "produced by the Greedy Coordinate Gradient algorithm that contribute the most towards lowering the NLL of the target output.\n"
         "Rewrite the prompt so that it incorporates these semantic suggestions to improve reasoning, but ensure the new prompt "
-        "remains human-readable, coherent, and grammatically correct. Output ONLY the new prompt text."
+        "remains human-readable, coherent, and grammatically correct. It is not necessary to include all suggestions or feedback as long as the prompt has converged and been optimized. Output ONLY the new prompt text."
     )
     
     mediator_user_prompt = (
@@ -185,7 +185,7 @@ def optimize_prompt_pipeline(train_parquet_path, iterations=5, batch_size=3):
                 top_k_indices = torch.topk(-grads[i], k=3).indices
                 suggested_tokens = processor.tokenizer.convert_ids_to_tokens(top_k_indices)
                 orig_token = processor.tokenizer.decode(prompt_ids[i])
-                report += f"  - Token '{orig_token}' -> Try replacing with: {suggested_tokens}\n"
+                report += f"  - Token '{orig_token}' -> GCG produced: {suggested_tokens}\n"
             
             saliency_reports.append(report)
             
