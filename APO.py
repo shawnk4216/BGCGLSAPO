@@ -4,6 +4,7 @@ import pandas as pd
 from transformers import AutoProcessor, AutoModelForCausalLM, AutoTokenizer
 import random
 import os
+import json
 
 # ==========================================
 # 1. Core GCG Functions (From your snippet)
@@ -50,13 +51,17 @@ def get_token_gradients(model, inputs_dict, input_slice, target_slice, loss_slic
     # 5. Forward pass
     logits = model(**forward_kwargs).logits
     
-    # 6. Calculate NLL loss on the target tokens
     targets = input_ids[target_slice]
-    loss = nn.CrossEntropyLoss()(logits[0, loss_slice, :], targets)
-    loss.backward()
-    
-    # 7. Return the gradients and the scalar loss
-    return one_hot.grad.clone(), loss.item()
+
+    loss_fn = nn.CrossEntropyLoss(reduction='none')
+    token_losses = loss_fn(logits[0, loss_slice, :], targets)
+
+    # We still need a scalar to backpropagate the gradients to our one_hot vector
+    scalar_loss = token_losses.mean()
+    scalar_loss.backward()
+
+    # Return gradients, the scalar loss, AND the detached token-level losses
+    return one_hot.grad.clone(), scalar_loss.item(), token_losses.detach()
 
 def find_slice(full_sequence, subsequence):
     """Helper to find the slice of a subsequence within a larger 1D tensor."""
@@ -70,7 +75,7 @@ def find_slice(full_sequence, subsequence):
 # ==========================================
 # 2. Mediator LLM Function
 # ==========================================
-def query_mediator_llm(processor, model, original_prompt, saliency_report, nll_score):
+def query_mediator_llm(processor, model, original_prompt, saliency_report, token_nll_dict):
     """
     Uses the Mediator LLM (in this case, the same model) to rewrite the prompt 
     based on the GCG gradient saliency and loss score.
@@ -83,17 +88,22 @@ def query_mediator_llm(processor, model, original_prompt, saliency_report, nll_s
         "remains human-readable, coherent, and grammatically correct. It is not necessary to include all suggestions or feedback as long as the prompt has converged and been optimized. Output ONLY the new prompt text."
     )
     
+    # Format the NLL dictionary nicely for the LLM
+    formatted_nll_dict = json.dumps(token_nll_dict, indent=2)
+
     mediator_user_prompt = (
-        f"Original Prompt: '{original_prompt}'\n"
-        f"NLL Loss (Lower is better): {nll_score:.4f}\n\n"
-        f"Token Saliency and Suggested Replacements:\n{saliency_report}\n\n"
-        "Based on these gradient suggestions, provide the revised optimal prompt."
+        f"Original Prompt: '{original_prompt}'\n\n"
+        f"Input Token Saliency and Suggested Replacements:\n{saliency_report}\n"
+        f"Output Target Per-Token NLL Dictionary (Higher = Model struggled more):\n{formatted_nll_dict}\n\n"
+        "Based on these insights, provide the revised optimal prompt."
     )
     
     messages = [
         {"role": "system", "content": [{"type": "text", "text": mediator_system_prompt}]},
         {"role": "user", "content": [{"type": "text", "text": mediator_user_prompt}]}
     ]
+
+    
     
     inputs = processor.apply_chat_template(
         messages, add_generation_prompt=True, tokenize=True, return_dict=True, return_tensors="pt"
@@ -135,10 +145,11 @@ def optimize_prompt_pipeline(train_parquet_path, iterations=5, batch_size=3):
         
         # Sample a small batch for this iteration to get gradient signals
         batch = random.sample(dataset, batch_size)
-        
-        avg_loss = 0
+
+
         saliency_reports = []
-        
+        representative_nll_dict = {}
+
         for idx, item in enumerate(batch):
             question_text = item['question']
             target_text = item['answer']
@@ -174,12 +185,17 @@ def optimize_prompt_pipeline(train_parquet_path, iterations=5, batch_size=3):
             with torch.enable_grad():
                 for param in model.parameters():
                     param.requires_grad = False
-                grads, loss = get_token_gradients(model, inputs, input_slice, target_slice, loss_slice)
-            
-            avg_loss += loss
-            
+                grads, scalar_loss, token_losses = get_token_gradients(model, inputs, input_slice, target_slice, loss_slice)
+
             # Generate saliency report for the Mediator
-            report = f"Sample {idx+1} (Loss: {loss:.4f}):\n"
+            if not representative_nll_dict:
+                target_tokens = processor.tokenizer.convert_ids_to_tokens(target_ids)
+                representative_nll_dict = {
+                    f"{i:03d}_{tok}": round(float(loss), 4) 
+                    for i, (tok, loss) in enumerate(zip(target_tokens, token_losses))
+                }
+                
+            report = f"Sample {idx+1} (Avg Loss: {scalar_loss:.4f}):\n"
             for i in range(len(prompt_ids)):
                 # Top 3 gradient replacements for token 'i'
                 top_k_indices = torch.topk(-grads[i], k=3).indices
@@ -193,14 +209,11 @@ def optimize_prompt_pipeline(train_parquet_path, iterations=5, batch_size=3):
             print("Failed to find token slices in this batch. Retrying...")
             continue
             
-        avg_loss /= len(saliency_reports)
         combined_report = "\n".join(saliency_reports)
+        print("Passing GCG Saliency and Target NLL Dictionary to Mediator LLM...")
         
-        print(f"Average NLL Loss for current prompt: {avg_loss:.4f}")
-        print("Passing GCG Saliency to Mediator LLM...")
-        
-        # 3.4 Mediator LLM generates the new prompt
-        new_prompt = query_mediator_llm(processor, model, current_prompt, combined_report, avg_loss)
+        # 3.4 Mediator LLM generates the new prompt using the NLL Dictionary
+        new_prompt = query_mediator_llm(processor, model, current_prompt, combined_report, representative_nll_dict)
         print(f"\n[Mediator Revised Prompt]:\n{new_prompt}")
         
         current_prompt = new_prompt
