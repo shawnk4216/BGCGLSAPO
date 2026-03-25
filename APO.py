@@ -1,13 +1,13 @@
 import torch
 import torch.nn as nn
 import pandas as pd
-from transformers import AutoProcessor, AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoProcessor, AutoModelForCausalLM
 import random
 import os
 import json
 
 # ==========================================
-# 1. Core GCG Functions (From your snippet)
+# 1. Core GCG Functions
 # ==========================================
 def get_token_gradients(model, inputs_dict, input_slice, target_slice, loss_slice):
     """Computes gradients of the loss w.r.t the input token coordinates."""
@@ -63,14 +63,7 @@ def get_token_gradients(model, inputs_dict, input_slice, target_slice, loss_slic
     # Return gradients, the scalar loss, AND the detached token-level losses
     return one_hot.grad.clone(), scalar_loss.item(), token_losses.detach()
 
-def find_slice(full_sequence, subsequence):
-    """Helper to find the slice of a subsequence within a larger 1D tensor."""
-    seq_len = len(full_sequence)
-    sub_len = len(subsequence)
-    for i in range(seq_len - sub_len + 1):
-        if torch.equal(full_sequence[i : i + sub_len], subsequence):
-            return slice(i, i + sub_len)
-    raise ValueError("Subsequence not found in the full sequence.")
+# (Removed find_slice function entirely)
 
 # ==========================================
 # 2. Mediator LLM Function
@@ -88,7 +81,6 @@ def query_mediator_llm(processor, model, original_prompt, saliency_report, token
         "remains human-readable, coherent, and grammatically correct. It is not necessary to include all suggestions or feedback as long as the prompt has converged and been optimized. Output ONLY the new prompt text."
     )
     
-    # Format the NLL dictionary nicely for the LLM
     formatted_nll_dict = json.dumps(token_nll_dict, indent=2)
 
     mediator_user_prompt = (
@@ -102,8 +94,6 @@ def query_mediator_llm(processor, model, original_prompt, saliency_report, token
         {"role": "system", "content": [{"type": "text", "text": mediator_system_prompt}]},
         {"role": "user", "content": [{"type": "text", "text": mediator_user_prompt}]}
     ]
-
-    
     
     inputs = processor.apply_chat_template(
         messages, add_generation_prompt=True, tokenize=True, return_dict=True, return_tensors="pt"
@@ -112,7 +102,6 @@ def query_mediator_llm(processor, model, original_prompt, saliency_report, token
     with torch.no_grad():
         outputs = model.generate(**inputs, max_new_tokens=150, temperature=0.7)
         
-    # Extract just the generated text
     generated_ids = outputs[0][inputs["input_ids"].shape[1]:]
     new_prompt = processor.tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
     return new_prompt
@@ -121,8 +110,7 @@ def query_mediator_llm(processor, model, original_prompt, saliency_report, token
 # 3. Main APO Optimization Pipeline
 # ==========================================
 def optimize_prompt_pipeline(train_parquet_path, iterations=5, batch_size=3):
-    # 3.1 Initialize Model & Processor
-    model_id = "google/gemma-3-12b-it" # Or a smaller model for testing
+    model_id = "google/gemma-3-12b-it" 
     
     print("Loading Model...")
     model = AutoModelForCausalLM.from_pretrained(
@@ -130,23 +118,17 @@ def optimize_prompt_pipeline(train_parquet_path, iterations=5, batch_size=3):
     ).eval()
     processor = AutoProcessor.from_pretrained(model_id)
     
-    # 3.2 Load Dataset (GSM8K/SVAMP parquet files)
     print(f"Loading dataset from {train_parquet_path}...")
     df = pd.read_parquet(train_parquet_path)
-    # Assuming columns 'question' and 'answer' based on HuggingFace standard
     dataset = df.to_dict('records')
     
-    # 3.3 Initialize Seed Prompt
     current_prompt = "Solve the following math word problem step by step and provide the final answer."
     print(f"\n[Seed Prompt]: {current_prompt}")
     
     for iteration in range(iterations):
         print(f"\n{'='*40}\nIteration {iteration + 1}/{iterations}\n{'='*40}")
         
-        # Sample a small batch for this iteration to get gradient signals
         batch = random.sample(dataset, batch_size)
-
-
         saliency_reports = []
         representative_nll_dict = {}
 
@@ -154,32 +136,39 @@ def optimize_prompt_pipeline(train_parquet_path, iterations=5, batch_size=3):
             question_text = item['question']
             target_text = item['answer']
             
-            # Combine the current prompt and the question
-            full_user_text = f"{current_prompt}\n\nQuestion: {question_text}"
+            # --- FORCED TOKEN CONCATENATION ---
+            # 1. Tokenize components separately to freeze their boundaries
+            bos_id = processor.tokenizer.bos_token_id
+            bos_tensor = torch.tensor([[bos_id]], device=model.device) if bos_id is not None else torch.empty((1,0), dtype=torch.long, device=model.device)
             
-            messages = [
-                {"role": "user", "content": [{"type": "text", "text": full_user_text}]},
-                {"role": "assistant", "content": [{"type": "text", "text": target_text}]}
-            ]
-            
-            inputs = processor.apply_chat_template(
-                messages, add_generation_prompt=False, tokenize=True, return_dict=True, return_tensors="pt"
-            ).to(model.device, dtype=torch.bfloat16)
-            
-            input_ids_1d = inputs["input_ids"][0]
-            
-            # Find slices (Using text without special tokens to locate)
-            prompt_ids = torch.tensor(processor.tokenizer.encode(current_prompt, add_special_tokens=False), device=model.device)
-            target_ids = torch.tensor(processor.tokenizer.encode(target_text, add_special_tokens=False), device=model.device)
-            
-            try:
-                input_slice = find_slice(input_ids_1d, prompt_ids)
-                target_slice = find_slice(input_ids_1d, target_ids)
-            except ValueError:
-                # If exact slice fails due to tokenization boundaries, skip this sample
-                continue 
-                
+            prompt_ids_2d = processor.tokenizer.encode(current_prompt, add_special_tokens=False, return_tensors="pt").to(model.device)
+            # Add basic structural formatting natively to the question string
+            question_ids_2d = processor.tokenizer.encode(f"\n\nQuestion: {question_text}\nAnswer: ", add_special_tokens=False, return_tensors="pt").to(model.device)
+            target_ids_2d = processor.tokenizer.encode(target_text, add_special_tokens=False, return_tensors="pt").to(model.device)
+
+            # 2. Calculate exact lengths
+            bos_len = bos_tensor.shape[1]
+            prompt_len = prompt_ids_2d.shape[1]
+            question_len = question_ids_2d.shape[1]
+            target_len = target_ids_2d.shape[1]
+
+            # 3. Define mathematical slices
+            prompt_start = bos_len
+            input_slice = slice(prompt_start, prompt_start + prompt_len)
+
+            target_start = bos_len + prompt_len + question_len
+            target_slice = slice(target_start, target_start + target_len)
             loss_slice = slice(target_slice.start - 1, target_slice.stop - 1)
+
+            # 4. Stitch tensors together
+            input_ids = torch.cat([bos_tensor, prompt_ids_2d, question_ids_2d, target_ids_2d], dim=1)
+            attention_mask = torch.ones_like(input_ids)
+            
+            inputs = {"input_ids": input_ids, "attention_mask": attention_mask}
+            
+            # Extract 1D IDs for downstream decoding
+            prompt_ids = prompt_ids_2d.squeeze(0)
+            target_ids = target_ids_2d.squeeze(0)
             
             # Run GCG optimization step
             with torch.enable_grad():
@@ -197,7 +186,6 @@ def optimize_prompt_pipeline(train_parquet_path, iterations=5, batch_size=3):
                 
             report = f"Sample {idx+1} (Avg Loss: {scalar_loss:.4f}):\n"
             for i in range(len(prompt_ids)):
-                # Top 3 gradient replacements for token 'i'
                 top_k_indices = torch.topk(-grads[i], k=3).indices
                 suggested_tokens = processor.tokenizer.convert_ids_to_tokens(top_k_indices)
                 orig_token = processor.tokenizer.decode(prompt_ids[i])
@@ -205,14 +193,9 @@ def optimize_prompt_pipeline(train_parquet_path, iterations=5, batch_size=3):
             
             saliency_reports.append(report)
             
-        if not saliency_reports:
-            print("Failed to find token slices in this batch. Retrying...")
-            continue
-            
         combined_report = "\n".join(saliency_reports)
         print("Passing GCG Saliency and Target NLL Dictionary to Mediator LLM...")
         
-        # 3.4 Mediator LLM generates the new prompt using the NLL Dictionary
         new_prompt = query_mediator_llm(processor, model, current_prompt, combined_report, representative_nll_dict)
         print(f"\n[Mediator Revised Prompt]:\n{new_prompt}")
         
@@ -223,9 +206,6 @@ def optimize_prompt_pipeline(train_parquet_path, iterations=5, batch_size=3):
     return current_prompt
 
 if __name__ == "__main__":
-    # Ensure you have 'pyarrow' or 'fastparquet' installed to read the parquet files.
-    # pip install pyarrow pandas torch transformers accelerate
-    
     train_file = "train-00000-of-00001.parquet"
     if os.path.exists(train_file):
         final_prompt = optimize_prompt_pipeline(train_file, iterations=5, batch_size=2)
