@@ -82,7 +82,7 @@ def query_mediator_llm(processor, model, original_prompt, saliency_report, token
     """
     mediator_system_prompt = (
         "You are an expert Prompt Engineer. Your task is to optimize a task prompt based on gradient-based token saliency. "
-        "You will be given the original prompt, its Negative Log-Likelihood (NLL) score, and a list of tokens "
+        "You will be given the original prompt, its per-token Negative Log-Likelihood (NLL) score, and a list of tokens "
         "produced by the Greedy Coordinate Gradient algorithm that contribute the most towards lowering the NLL of the target output.\n"
         "Rewrite the prompt so that it incorporates these semantic suggestions to improve reasoning, but ensure the new prompt "
         "remains human-readable, coherent, and grammatically correct. It is not necessary to include all suggestions or feedback as long as the prompt has converged and been optimized. Output ONLY the new prompt text."
